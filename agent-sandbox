@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# agent-sandbox — запускает opencode (или другой агент: claude, codex, crush...)
+# в песочнице bubblewrap. Агенту и всему, что он запускает, видны только:
+#   * текущая директория и её дочерние (чтение/запись);
+#   * системные программы и библиотеки (/usr, только чтение) и минимальный набор /etc;
+#   * собственный HOME песочницы (отдельный на каждый проект, НЕ ваш реальный ~);
+#   * общий каталог с токенами авторизации агентов (см. SHARED_FILES).
+# Реальный $HOME, другие проекты, /media, /mnt, /run/user (ssh-agent, D-Bus,
+# Wayland/X11-сокеты), процессы хоста — не видны.
+#
+# Использование:
+#   cd ~/projects/myproj && agent-sandbox                 # запустить opencode
+#   agent-sandbox -- opencode run "fix the tests"          # с аргументами
+#   agent-sandbox -- claude                                # другой агент
+#   agent-sandbox --shell                                  # bash внутри песочницы (проверить, что видно)
+#   agent-sandbox --net host                               # общая сеть с хостом (напр., для ollama)
+#
+# Зависимости: sudo apt install bubblewrap passt
+
+set -euo pipefail
+
+# ---------------------------------------------------------------- настройки ---
+STATE_ROOT="${AGENT_SANDBOX_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/agent-sandbox}"
+DEFAULT_CMD=(opencode)
+
+# Файлы (относительно HOME), которые общие для всех проектов: токены после
+# `opencode auth login` и т.п. В HOME песочницы на их месте лежат симлинки
+# в общий каталог, поэтому логиниться нужно один раз, а не в каждом проекте.
+SHARED_FILES=(
+    .local/share/opencode/auth.json
+    .claude/.credentials.json
+    .codex/auth.json
+)
+
+# Переменные окружения, которые пробрасываются внутрь (остальные вычищаются).
+PASS_ENV_EXACT=(TERM COLORTERM TERM_PROGRAM LANG LANGUAGE LC_ALL LC_CTYPE TZ
+                HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy ALL_PROXY all_proxy
+                NODE_EXTRA_CA_CERTS EDITOR VISUAL)
+PASS_ENV_REGEX='^([A-Z0-9_]+_API_KEY|[A-Z0-9_]+_BASE_URL|OPENCODE_[A-Z0-9_]+|ANTHROPIC_[A-Z0-9_]+|OPENAI_[A-Z0-9_]+)$'
+
+# Что из /etc показывать (только чтение; отсутствующие пропускаются).
+ETC_ITEMS=(alternatives ssl ca-certificates ca-certificates.conf pki
+           ld.so.cache ld.so.conf ld.so.conf.d localtime timezone
+           nsswitch.conf hosts host.conf gai.conf protocols services
+           mime.types magic magic.mime bash.bashrc profile profile.d inputrc
+           terminfo locale.alias os-release lsb-release debian_version
+           gitconfig vim vimrc nanorc)
+
+# --------------------------------------------------------------- аргументы ---
+NET_MODE=auto        # auto | host | isolated | none
+HOME_DIR=""          # явный HOME песочницы (по умолчанию — свой на проект)
+DRY_RUN=0
+EXTRA_MOUNTS=()
+EXTRA_ENV=()
+ALLOW_PORTS=()       # порты localhost хоста, доступные в --net isolated
+CMD=()
+
+die()  { printf 'agent-sandbox: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'agent-sandbox: warning: %s\n' "$*" >&2; }
+
+usage() {
+    sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "$0"
+    cat <<'EOF'
+Опции:
+  -n, --net MODE     auto (по умолчанию) — isolated, если установлен passt, иначе host;
+                     isolated — свой сетевой namespace через pasta: интернет есть,
+                       но нет доступа к localhost хоста и abstract unix-сокетам;
+                     host — общая сеть с хостом (нужно, напр., для ollama на localhost);
+                     none — сети нет вообще.
+  -p, --allow-port PORT  в режиме isolated открыть доступ к 127.0.0.1:PORT хоста
+                     (порт локального прокси/VPN из HTTP(S)_PROXY, ALL_PROXY или
+                     системных настроек прокси GNOME открывается автоматически)
+      --ro PATH[:DEST]   дополнительно примонтировать PATH только для чтения
+      --rw PATH[:DEST]   дополнительно примонтировать PATH для чтения/записи
+  -e, --env NAME[=VAL]   пробросить/задать переменную окружения
+      --home DIR     использовать DIR как HOME песочницы (напр. общий для нескольких проектов)
+      --shell        запустить bash вместо агента
+      --dry-run      напечатать команду bwrap и выйти
+  -h, --help         эта справка
+  -- CMD [ARGS...]   команда для запуска (по умолчанию: opencode)
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        -n|--net)   NET_MODE="${2:?}"; shift 2 ;;
+        --ro)       EXTRA_MOUNTS+=(--ro-bind "${2:?}"); shift 2 ;;
+        --rw)       EXTRA_MOUNTS+=(--bind "${2:?}"); shift 2 ;;
+        -e|--env)   EXTRA_ENV+=("${2:?}"); shift 2 ;;
+        --home)     HOME_DIR="${2:?}"; shift 2 ;;
+        -p|--allow-port) [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--allow-port: нужен номер порта"
+                    ALLOW_PORTS+=("$2"); shift 2 ;;
+        --shell)    CMD=(bash); shift ;;
+        --dry-run)  DRY_RUN=1; shift ;;
+        -h|--help)  usage; exit 0 ;;
+        --)         shift; CMD=("$@"); break ;;
+        -*)         die "неизвестная опция: $1 (см. --help)" ;;
+        *)          CMD=("$@"); break ;;
+    esac
+done
+((${#CMD[@]})) || CMD=("${DEFAULT_CMD[@]}")
+case "$NET_MODE" in
+    auto) if command -v pasta >/dev/null; then NET_MODE=isolated; else NET_MODE=host
+              warn "passt не установлен — сеть общая с хостом (агенту доступны сервисы на localhost"
+              warn "и abstract-сокеты X11/D-Bus). Рекомендуется: sudo apt install passt"; fi ;;
+    host|isolated|none) ;;
+    *) die "--net: auto | host | isolated | none" ;;
+esac
+
+command -v bwrap >/dev/null || die "bubblewrap не установлен: sudo apt install bubblewrap"
+
+# ------------------------------------------------------------ прокси / VPN ---
+# VPN-клиенты в режиме прокси (OneXray, v2rayN, Hiddify, nekoray...) слушают на
+# 127.0.0.1. Если прокси задан только в настройках GNOME — переносим его в
+# переменные окружения, иначе CLI-программы его не увидят.
+if [[ -z "${HTTPS_PROXY:-}${https_proxy:-}${HTTP_PROXY:-}${http_proxy:-}${ALL_PROXY:-}${all_proxy:-}" ]] \
+   && command -v gsettings >/dev/null \
+   && [[ "$(timeout 2 gsettings get org.gnome.system.proxy mode 2>/dev/null)" == "'manual'" ]]; then
+    gs() { timeout 2 gsettings get "org.gnome.system.proxy.$1" "$2" 2>/dev/null | tr -d "'"; }
+    for kind in https http; do
+        h="$(gs "$kind" host)"; p="$(gs "$kind" port)"
+        if [[ -n "$h" && "${p:-0}" != 0 ]]; then
+            export HTTPS_PROXY="http://$h:$p" HTTP_PROXY="http://$h:$p"
+            export https_proxy="$HTTPS_PROXY" http_proxy="$HTTP_PROXY"
+            break
+        fi
+    done
+    h="$(gs socks host)"; p="$(gs socks port)"
+    if [[ -n "$h" && "${p:-0}" != 0 ]]; then
+        export ALL_PROXY="socks5h://$h:$p" all_proxy="socks5h://$h:$p"
+    fi
+    np="$(timeout 2 gsettings get org.gnome.system.proxy ignore-hosts 2>/dev/null | tr -d "[]' ")"
+    [[ -n "$np" ]] && export NO_PROXY="$np" no_proxy="$np"
+fi
+for v in HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy; do
+    if [[ "${!v:-}" =~ ^[a-zA-Z0-9+]*://([^@/]*@)?(localhost|127\.[0-9.]+|\[::1\]):([0-9]+) ]]; then
+        port="${BASH_REMATCH[3]}"
+        [[ " ${ALLOW_PORTS[*]} " == *" $port "* ]] || ALLOW_PORTS+=("$port")
+    fi
+done
+
+# ---------------------------------------------------------------- проверки ---
+PROJECT="$(pwd -P)"
+REAL_HOME="$(cd "$HOME" && pwd -P)"
+case "$PROJECT/" in
+    /|"$REAL_HOME/") die "нельзя запускать из $PROJECT — это откроет агенту слишком много" ;;
+esac
+case "$REAL_HOME/" in
+    "$PROJECT"/*) die "$PROJECT содержит ваш HOME — запустите из директории проекта" ;;
+esac
+case "$PROJECT/" in
+    "$STATE_ROOT"/*) die "нельзя запускать изнутри $STATE_ROOT" ;;
+esac
+
+# ------------------------------------------------------------- HOME песочницы ---
+if [[ -z "$HOME_DIR" ]]; then
+    hash="$(printf '%s' "$PROJECT" | sha256sum | cut -c1-12)"
+    HOME_DIR="$STATE_ROOT/homes/$(basename "$PROJECT")-$hash"
+fi
+SHARED_DIR="$STATE_ROOT/shared"
+SHARED_MNT=/run/agent-sandbox/shared
+mkdir -p "$HOME_DIR" "$SHARED_DIR"
+chmod 700 "$STATE_ROOT" "$SHARED_DIR" 2>/dev/null || true
+printf '%s\n' "$PROJECT" > "$HOME_DIR/.agent-sandbox-project"   # чтобы понимать, чей это HOME
+
+for rel in "${SHARED_FILES[@]}"; do
+    mkdir -p "$(dirname "$HOME_DIR/$rel")" "$(dirname "$SHARED_DIR/$rel")"
+    if [[ ! -e "$HOME_DIR/$rel" && ! -L "$HOME_DIR/$rel" ]]; then
+        ln -s "$SHARED_MNT/$rel" "$HOME_DIR/$rel"
+    fi
+done
+
+# ---------------------------------------------------------- бинарник агента ---
+# Если агент установлен в ваш HOME (~/.opencode/bin, ~/.npm-global, ~/.local/bin...),
+# то сам каталог установки не монтируется — монтируется только бинарник (ELF).
+AGENT_BIN_DIR=/run/agent-sandbox/bin
+BIN_MOUNTS=()
+declare -A seen=()
+for name in "${CMD[0]}" opencode claude codex crush; do
+    [[ "$name" == */* || -n "${seen[$name]:-}" ]] && continue
+    seen[$name]=1
+    host_path="$(command -v -- "$name" 2>/dev/null)" && [[ "$host_path" == /* ]] || continue
+    real="$(readlink -f -- "$host_path")"
+    case "$real" in /usr/*) continue ;; esac     # системный — и так виден
+    if [[ "$(head -c4 -- "$real" | od -An -c | tr -d ' ')" == '177ELF' ]]; then
+        BIN_MOUNTS+=(--ro-bind "$real" "$AGENT_BIN_DIR/$name")
+    elif [[ "$name" == "${CMD[0]}" ]]; then
+        warn "$name ($real) — не самостоятельный бинарник, а скрипт."
+        warn "Его окружение (node, node_modules...) нужно примонтировать через --ro,"
+        warn "либо установить агента внутри песочницы: agent-sandbox --shell"
+    fi
+done
+
+# ----------------------------------------------------------------- окружение ---
+SB_PATH="$AGENT_BIN_DIR:$HOME/.local/bin:$HOME/.opencode/bin:$HOME/.bun/bin:$HOME/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ENV_ARGS=(--clearenv
+    --setenv HOME "$HOME" --setenv USER "$USER" --setenv LOGNAME "$USER"
+    --setenv SHELL /bin/bash --setenv PATH "$SB_PATH" --setenv TMPDIR /tmp
+    --setenv AGENT_SANDBOX 1
+    --setenv OPENCODE_DISABLE_AUTOUPDATE 1)      # бинарник read-only, обновлять снаружи
+for v in "${PASS_ENV_EXACT[@]}"; do
+    [[ -n "${!v+x}" ]] && ENV_ARGS+=(--setenv "$v" "${!v}")
+done
+while IFS= read -r v; do
+    [[ "$v" =~ $PASS_ENV_REGEX ]] && ENV_ARGS+=(--setenv "$v" "${!v}")
+done < <(compgen -e)
+# Имя/почта для коммитов (сам ~/.gitconfig и ssh-ключи внутрь не попадают).
+if command -v git >/dev/null; then
+    gn="$(git config --global --get user.name 2>/dev/null || true)"
+    ge="$(git config --global --get user.email 2>/dev/null || true)"
+    [[ -n "$gn" ]] && ENV_ARGS+=(--setenv GIT_AUTHOR_NAME "$gn" --setenv GIT_COMMITTER_NAME "$gn")
+    [[ -n "$ge" ]] && ENV_ARGS+=(--setenv GIT_AUTHOR_EMAIL "$ge" --setenv GIT_COMMITTER_EMAIL "$ge")
+fi
+for kv in "${EXTRA_ENV[@]}"; do
+    if [[ "$kv" == *=* ]]; then ENV_ARGS+=(--setenv "${kv%%=*}" "${kv#*=}")
+    elif [[ -n "${!kv+x}" ]]; then ENV_ARGS+=(--setenv "$kv" "${!kv}")
+    fi
+done
+
+# ------------------------------------------------------------ файловая система ---
+FS_ARGS=(--ro-bind /usr /usr)
+for d in bin sbin lib lib32 lib64 libx32; do
+    if [[ -L "/$d" ]]; then FS_ARGS+=(--symlink "$(readlink "/$d")" "/$d")
+    elif [[ -d "/$d" ]]; then FS_ARGS+=(--ro-bind "/$d" "/$d")
+    fi
+done
+for e in "${ETC_ITEMS[@]}"; do FS_ARGS+=(--ro-bind-try "/etc/$e" "/etc/$e"); done
+
+FS_ARGS+=(--proc /proc --dev /dev --tmpfs /tmp --dir /var --tmpfs /var/tmp
+          --tmpfs /run --dir /run/agent-sandbox)
+
+# Сгенерированные файлы для /etc песочницы. Не через --ro-bind-data/fd:
+# новые версии pasta закрывают все унаследованные дескрипторы, кроме 0-2.
+GEN_DIR="$STATE_ROOT/etc"
+mkdir -p "$GEN_DIR"
+put_file() {   # put_file NAME CONTENT — атомарно, на случай параллельных запусков
+    local tmp
+    tmp="$(mktemp "$GEN_DIR/.$1.XXXXXX")"
+    printf '%s\n' "$2" > "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$GEN_DIR/$1"
+}
+
+# Сеть и DNS
+case "$NET_MODE" in
+    host)
+        # На Ubuntu /etc/resolv.conf — симлинк в /run/systemd/resolve/.
+        [[ -e /etc/resolv.conf ]] && FS_ARGS+=(--ro-bind "$(readlink -f /etc/resolv.conf)" /etc/resolv.conf) ;;
+    isolated)
+        command -v pasta >/dev/null || die "--net isolated требует pasta: sudo apt install passt"
+        DNS_FWD=169.254.1.53
+        put_file resolv.conf "nameserver $DNS_FWD"
+        FS_ARGS+=(--ro-bind "$GEN_DIR/resolv.conf" /etc/resolv.conf) ;;
+    none) ;;
+esac
+
+# Минимальные passwd/group: только ваш пользователь, без остальных учёток хоста.
+GROUP_NAME="$(id -gn)"
+PASSWD_DATA="$(printf '%s:x:%d:%d::%s:/bin/bash\nnobody:x:65534:65534::/nonexistent:/usr/sbin/nologin\n' "$USER" "$(id -u)" "$(id -g)" "$HOME")"
+GROUP_DATA="$(printf '%s:x:%d:\nnogroup:x:65534:\n' "$GROUP_NAME" "$(id -g)")"
+put_file passwd "$PASSWD_DATA"
+put_file group "$GROUP_DATA"
+FS_ARGS+=(--ro-bind "$GEN_DIR/passwd" /etc/passwd --ro-bind "$GEN_DIR/group" /etc/group)
+
+# Порядок важен: сначала HOME песочницы, потом то, что внутри него.
+FS_ARGS+=(--bind "$HOME_DIR" "$HOME"
+          --bind "$SHARED_DIR" "$SHARED_MNT"
+          "${BIN_MOUNTS[@]}")
+for ((i = 0; i < ${#EXTRA_MOUNTS[@]}; i += 2)); do
+    spec="${EXTRA_MOUNTS[i+1]}"; src="${spec%%:*}"; dst="${spec#*:}"
+    [[ "$spec" == *:* ]] || dst="$src"
+    src="$(readlink -f -- "$src")" || die "нет такого пути: $spec"
+    [[ -e "$src" ]] || die "нет такого пути: $spec"
+    FS_ARGS+=("${EXTRA_MOUNTS[i]}" "$src" "$dst")
+done
+FS_ARGS+=(--bind "$PROJECT" "$PROJECT" --chdir "$PROJECT"
+          --remount-ro /)      # корень песочницы (tmpfs) — только чтение
+
+# ------------------------------------------------------------- namespaces ---
+NS_ARGS=(--unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup-try
+         --hostname agent-sandbox --die-with-parent
+         --uid "$(id -u)" --gid "$(id -g)")
+[[ "$NET_MODE" == none ]] && NS_ARGS+=(--unshare-net)
+
+# Защита от TIOCSTI (подстановка ввода в ваш терминал). На ядрах >= 6.2 с
+# dev.tty.legacy_tiocsti=0 она не нужна; иначе — новая сессия, но тогда у TUI
+# может не работать ресайз окна.
+if [[ ! -t 0 ]] || [[ "$(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null || echo 1)" != 0 ]]; then
+    NS_ARGS+=(--new-session)
+fi
+
+BWRAP=(bwrap "${NS_ARGS[@]}" "${FS_ARGS[@]}" "${ENV_ARGS[@]}" -- "${CMD[@]}")
+WRAP=()
+if [[ "$NET_MODE" == isolated ]]; then
+    # Свой netns; наружу NAT через pasta. Из портов localhost хоста пробрасываются
+    # только ALLOW_PORTS (-T), шлюз не отображается на loopback хоста (--no-map-gw).
+    T_SPEC=none
+    if ((${#ALLOW_PORTS[@]})); then
+        T_SPEC="$(IFS=,; echo "${ALLOW_PORTS[*]}")"
+        printf 'agent-sandbox: доступ к localhost хоста открыт только для портов: %s\n' "$T_SPEC" >&2
+    fi
+    WRAP=(pasta --config-net --quiet --no-map-gw -t none -u none -T "$T_SPEC" -U none
+          --dns-forward "$DNS_FWD" --)
+fi
+
+if ((DRY_RUN)); then
+    printf '%q ' "${WRAP[@]}" "${BWRAP[@]}"; echo
+    exit 0
+fi
+
+# Быстрая проверка, что user namespaces разрешены (Ubuntu 24.04+ и AppArmor).
+if ! err="$(bwrap --unshare-user --ro-bind / / -- /usr/bin/true 2>&1)"; then
+    printf 'agent-sandbox: bwrap не смог создать namespace: %s\n' "$err" >&2
+    if [[ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" == 1 ]]; then
+        cat >&2 <<'EOF'
+
+Ubuntu ограничивает непривилегированные user namespaces через AppArmor.
+Разрешите их только для bwrap:
+
+sudo tee /etc/apparmor.d/bwrap >/dev/null <<'PROFILE'
+abi <abi/4.0>,
+include <tunables/global>
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/bwrap>
+}
+PROFILE
+sudo apparmor_parser -r /etc/apparmor.d/bwrap
+EOF
+    fi
+    exit 1
+fi
+
+exec "${WRAP[@]}" "${BWRAP[@]}"
